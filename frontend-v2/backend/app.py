@@ -32,6 +32,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 DOTENV_PATH = PROJECT_ROOT / ".env"
 
+# Force FACTOR_LIBRARY_DB to absolute path so subprocesses and API use the same DB
+FACTOR_LIBRARY_DB = os.environ.get("FACTOR_LIBRARY_DB", "data/factorlib/factor_library.db")
+os.environ.setdefault("FACTOR_LIBRARY_DB", str(PROJECT_ROOT / FACTOR_LIBRARY_DB))
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -65,7 +69,7 @@ class MiningStartRequest(BaseModel):
 
 class BacktestStartRequest(BaseModel):
     """Request to start an independent backtest."""
-    factorJson: str = Field(..., description="Path to factor library JSON")
+    libraryName: str = Field("default", description="Factor library name (from SQLite)")
     factorSource: str = Field("custom", description="custom | combined")
     configPath: Optional[str] = Field(None, description="Path to backtest config")
 
@@ -117,26 +121,21 @@ def _load_dotenv_dict() -> Dict[str, str]:
     return env
 
 
-def _find_factor_jsons() -> List[str]:
-    """Find all factor library JSON files in data/factorlib/."""
-    factorlib_dir = PROJECT_ROOT / "data" / "factorlib"
-    pattern = str(factorlib_dir / "all_factors_library*.json")
-    results = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-
-    old_pattern = str(PROJECT_ROOT / "all_factors_library*.json")
-    old_results = sorted(glob.glob(old_pattern), key=os.path.getmtime, reverse=True)
-
-    seen = set(results)
-    for r in old_results:
-        if r not in seen:
-            results.append(r)
-    return results
+def _get_factor_libraries() -> List[Dict[str, Any]]:
+    """Get all factor libraries from SQLite."""
+    from quantaalpha.factors.library import FactorLibraryManager
+    try:
+        manager = FactorLibraryManager()
+        return manager.get_all_libraries()
+    except Exception as e:
+        logger.warning(f"Failed to list factor libraries: {e}")
+        return []
 
 
-def _load_factor_library(path: str) -> Dict[str, Any]:
-    """Load and parse a factor library JSON file."""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _get_manager() -> Any:
+    """Get or create the FactorLibraryManager singleton."""
+    from quantaalpha.factors.library import FactorLibraryManager
+    return FactorLibraryManager()
 
 
 def _classify_quality(backtest_results: Dict[str, Any]) -> str:
@@ -572,93 +571,79 @@ async def get_factors(
     search: Optional[str] = Query(None, description="Search by factor name"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    library: Optional[str] = Query(None, description="Specific library file name"),
+    library: Optional[str] = Query(None, description="Library name (e.g. 'default', 'exp_xxx')"),
 ):
-    """Get factors from the factor library JSON."""
-    # Find the most recent factor library
-    if library:
-        lib_path = str(PROJECT_ROOT / "data" / "factorlib" / library)
-        # Fallback: check if file exists at project root (legacy location)
-        if not Path(lib_path).exists():
-            alt = str(PROJECT_ROOT / library)
-            if Path(alt).exists():
-                lib_path = alt
-    else:
-        jsons = _find_factor_jsons()
-        if not jsons:
-            return ApiResponse(
-                success=True,
-                data={"factors": [], "total": 0, "limit": limit, "offset": offset,
-                      "libraries": []},
-            )
-        lib_path = jsons[0]
+    """Get factors from the SQLite factor library.
 
-    try:
-        raw = _load_factor_library(lib_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read factor library: {e}")
+    When `library` is omitted, returns factors from ALL libraries combined.
+    When `library` is specified, returns only factors from that library.
+    """
+    manager = _get_manager()
+    libraries = _get_factor_libraries()
 
-    factors_dict = raw.get("factors", {})
-    metadata = raw.get("metadata", {})
+    if not libraries:
+        return ApiResponse(
+            success=True,
+            data={"factors": [], "total": 0, "limit": limit, "offset": offset,
+                  "libraries": []},
+        )
 
-    # Convert dict to list with quality classification
-    factors_list: List[Dict[str, Any]] = []
-    for factor_id, factor_info in factors_dict.items():
-        if not isinstance(factor_info, dict):
-            continue
-        bt = factor_info.get("backtest_results", {})
-        q = _classify_quality(bt)
-        # Extract metrics with proper fallbacks
-        # Try specific keys first, then standard ones
-        ic = bt.get("IC", bt.get("1day.excess_return_without_cost.information_coefficient", 0))
-        icir = bt.get("ICIR", bt.get("1day.excess_return_without_cost.information_coefficient_ir", 0))
-        rank_ic = bt.get("Rank IC", bt.get("rank_ic", bt.get("1day.excess_return_without_cost.rank_ic", 0)))
-        rank_icir = bt.get("Rank ICIR", bt.get("rank_ic_ir", bt.get("1day.excess_return_without_cost.rank_ic_ir", 0)))
-        
-        factor_entry = {
-            "factorId": factor_info.get("factor_id", factor_id),
-            "factorName": factor_info.get("factor_name", "Unknown"),
-            "factorExpression": factor_info.get("factor_expression", ""),
-            "factorDescription": factor_info.get("factor_description", ""),
-            "factorFormulation": factor_info.get("factor_formulation", ""),
-            "quality": q,
-            "backtestResults": bt,
-            # Extract key metrics
-            "ic": ic,
-            "icir": icir,
-            "rankIc": rank_ic,
-            "rankIcir": rank_icir,
-            "annualReturn": bt.get("1day.excess_return_with_cost.annualized_return", 
-                                  bt.get("1day.excess_return_without_cost.annualized_return", 0)),
-            "maxDrawdown": bt.get("1day.excess_return_with_cost.max_drawdown", 
-                                 bt.get("1day.excess_return_without_cost.max_drawdown", 0)),
-            "sharpeRatio": bt.get("1day.excess_return_with_cost.information_ratio", 
-                                bt.get("1day.excess_return_without_cost.information_ratio", 0)),
-            "round": factor_info.get("evolution_metadata", {}).get("round", 0)
-            if isinstance(factor_info.get("evolution_metadata"), dict) else 0,
-            "direction": factor_info.get("evolution_metadata", {}).get("direction_index", "")
-            if isinstance(factor_info.get("evolution_metadata"), dict) else "",
-            "createdAt": factor_info.get("added_at", ""),
-        }
-        factors_list.append(factor_entry)
+    all_factors: List[Dict[str, Any]] = []
+    target_libraries = [library] if library else [lib["name"] for lib in libraries]
 
-    # Apply filters
+    for lib_name in target_libraries:
+        try:
+            raw_factors = manager.get_factors_by_library(lib_name)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read library '{lib_name}': {e}")
+
+        for factor_info in raw_factors:
+            bt = factor_info.get("backtest_results", {})
+            q = _classify_quality(bt)
+            ic = bt.get("IC", bt.get("1day.excess_return_without_cost.information_coefficient", 0))
+            icir = bt.get("ICIR", bt.get("1day.excess_return_without_cost.information_coefficient_ir", 0))
+            rank_ic = bt.get("Rank IC", bt.get("rank_ic", bt.get("1day.excess_return_without_cost.rank_ic", 0)))
+            rank_icir = bt.get("Rank ICIR", bt.get("rank_ic_ir", bt.get("1day.excess_return_without_cost.rank_ic_ir", 0)))
+            meta = factor_info.get("metadata", {})
+
+            factor_entry = {
+                "factorId": factor_info.get("factor_id"),
+                "factorName": factor_info.get("factor_name", "Unknown"),
+                "factorExpression": factor_info.get("factor_expression", ""),
+                "factorDescription": factor_info.get("factor_description", ""),
+                "factorFormulation": factor_info.get("factor_formulation", ""),
+                "libraryName": lib_name,
+                "quality": q,
+                "backtestResults": bt,
+                "ic": ic,
+                "icir": icir,
+                "rankIc": rank_ic,
+                "rankIcir": rank_icir,
+                "annualReturn": bt.get("1day.excess_return_with_cost.annualized_return",
+                                      bt.get("1day.excess_return_without_cost.annualized_return", 0)),
+                "maxDrawdown": bt.get("1day.excess_return_with_cost.max_drawdown",
+                                     bt.get("1day.excess_return_without_cost.max_drawdown", 0)),
+                "sharpeRatio": bt.get("1day.excess_return_with_cost.information_ratio",
+                                    bt.get("1day.excess_return_without_cost.information_ratio", 0)),
+                "round": meta.get("round_number", 0),
+                "direction": meta.get("planning_direction", ""),
+                "createdAt": meta.get("created_at", ""),
+            }
+            all_factors.append(factor_entry)
+
     if quality:
-        factors_list = [f for f in factors_list if f["quality"] == quality]
+        all_factors = [f for f in all_factors if f["quality"] == quality]
     if search:
         search_lower = search.lower()
-        factors_list = [
-            f for f in factors_list
+        all_factors = [
+            f for f in all_factors
             if search_lower in f["factorName"].lower()
             or search_lower in f.get("factorDescription", "").lower()
             or search_lower in f.get("factorExpression", "").lower()
         ]
 
-    total = len(factors_list)
-    paginated = factors_list[offset: offset + limit]
-
-    # Available library files
-    all_libs = [Path(p).name for p in _find_factor_jsons()]
+    total = len(all_factors)
+    paginated = all_factors[offset: offset + limit]
 
     return ApiResponse(
         success=True,
@@ -667,8 +652,8 @@ async def get_factors(
             "total": total,
             "limit": limit,
             "offset": offset,
-            "metadata": metadata,
-            "libraries": all_libs,
+            "metadata": {"library_name": library or "all", "total_factors": total},
+            "libraries": [lib["name"] for lib in libraries],
         },
     )
 
@@ -679,56 +664,39 @@ async def get_factors(
 
 @app.get("/api/v1/factors/cache-status", response_model=ApiResponse)
 async def get_cache_status(
-    library: Optional[str] = Query(None, description="Factor library JSON filename"),
+    library: Optional[str] = Query(None, description="Library name (e.g. 'default', 'exp_xxx')"),
 ):
     """Check cache status of factors in the specified factor library."""
-    if library:
-        lib_path = str(PROJECT_ROOT / "data" / "factorlib" / library)
-        if not Path(lib_path).exists():
-            alt = str(PROJECT_ROOT / library)
-            if Path(alt).exists():
-                lib_path = alt
-    else:
-        jsons = _find_factor_jsons()
-        if not jsons:
-            return ApiResponse(success=True, data={
-                "total": 0, "h5_cached": 0, "md5_cached": 0,
-                "need_compute": 0, "factors": [],
-            })
-        lib_path = jsons[0]
-
-    if not Path(lib_path).exists():
-        raise HTTPException(status_code=404, detail=f"Factor library not found: {library}")
-
-    # Import from core library
-    from quantaalpha.factors.library import FactorLibraryManager
-    result = FactorLibraryManager.check_cache_status(lib_path)
-    return ApiResponse(success=True, data=result)
+    manager = _get_manager()
+    libraries = _get_factor_libraries()
+    if not libraries:
+        return ApiResponse(success=True, data={
+            "total": 0, "h5_cached": 0, "md5_cached": 0,
+            "need_compute": 0, "factors": [],
+        })
+    library_name = library or libraries[0]["name"]
+    try:
+        result = manager.check_cache_status(library_name)
+        return ApiResponse(success=True, data=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache status failed: {e}")
 
 
 @app.post("/api/v1/factors/warm-cache", response_model=ApiResponse)
 async def warm_cache(
-    library: Optional[str] = Query(None, description="Factor library JSON filename"),
+    library: Optional[str] = Query(None, description="Library name (e.g. 'default', 'exp_xxx')"),
 ):
     """Batch sync from result.h5 to MD5 cache directory."""
-    if library:
-        lib_path = str(PROJECT_ROOT / "data" / "factorlib" / library)
-        if not Path(lib_path).exists():
-            alt = str(PROJECT_ROOT / library)
-            if Path(alt).exists():
-                lib_path = alt
-    else:
-        jsons = _find_factor_jsons()
-        if not jsons:
-            return ApiResponse(success=False, error="未找到因子库文件")
-        lib_path = jsons[0]
+    manager = _get_manager()
+    libraries = _get_factor_libraries()
+    if not libraries:
+        return ApiResponse(success=False, error="未找到因子库")
+    library_name = library or libraries[0]["name"]
+    try:
+        result = manager.warm_cache(library_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Warm cache failed: {e}")
 
-    if not Path(lib_path).exists():
-        raise HTTPException(status_code=404, detail=f"Factor library not found: {library}")
-
-    from quantaalpha.factors.library import FactorLibraryManager
-    result = FactorLibraryManager.warm_cache_from_json(lib_path)
-    # Build a clear message
     parts = []
     if result['synced']:
         parts.append(f"新同步 {result['synced']} 个")
@@ -739,32 +707,27 @@ async def warm_cache(
     if result['failed']:
         parts.append(f"失败 {result['failed']} 个")
     msg = "，".join(parts) if parts else "无需操作"
-    return ApiResponse(
-        success=True,
-        data=result,
-        message=msg,
-    )
+    return ApiResponse(success=True, data=result, message=msg)
 
 
 # ---- Factor library list endpoint (must be BEFORE {factor_id} route) ----
 
 @app.get("/api/v1/factors/libraries", response_model=ApiResponse)
 async def list_factor_libraries():
-    """List all factor library JSON files in the project root."""
-    libs = [Path(p).name for p in _find_factor_jsons()]
-    return ApiResponse(success=True, data={"libraries": libs})
+    """List all factor libraries from SQLite."""
+    libs = _get_factor_libraries()
+    return ApiResponse(success=True, data={"libraries": [lib["name"] for lib in libs]})
 
 
 @app.get("/api/v1/factors/{factor_id}", response_model=ApiResponse)
 async def get_factor_detail(factor_id: str):
-    """Get full detail of a single factor."""
-    jsons = _find_factor_jsons()
-    for lib_path in jsons:
+    """Get full detail of a single factor across all libraries."""
+    manager = _get_manager()
+    libraries = _get_factor_libraries()
+    for lib in libraries:
         try:
-            raw = _load_factor_library(lib_path)
-            factors = raw.get("factors", {})
-            if factor_id in factors:
-                info = factors[factor_id]
+            info = manager.get_factor(lib["name"], factor_id)
+            if info:
                 return ApiResponse(success=True, data={"factor": info})
         except Exception:
             continue
@@ -848,24 +811,8 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
         dotenv = _load_dotenv_dict()
         env.update(dotenv)
 
-        # --- Resolve factor JSON path ---
-        # Frontend sends just the filename (e.g. "all_factors_library_test3hjback.json")
-        # We need to resolve it to the full path under data/factorlib/
-        factor_json_input = req.factorJson
-        factor_json_path = Path(factor_json_input)
-        if not factor_json_path.is_absolute():
-            # Check data/factorlib/ first
-            candidate = PROJECT_ROOT / "data" / "factorlib" / factor_json_input
-            if candidate.exists():
-                factor_json_path = candidate
-            else:
-                # Try as relative to project root
-                candidate2 = PROJECT_ROOT / factor_json_input
-                if candidate2.exists():
-                    factor_json_path = candidate2
-                else:
-                    factor_json_path = candidate  # will fail with a clear error message
-        factor_json_str = str(factor_json_path)
+        # --- Use library name from SQLite ---
+        library_name = req.libraryName or "default"
 
         # --- Find the correct Python executable ---
         # Prefer the conda env that has qlib installed
@@ -897,7 +844,7 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
             python_bin, "-m", "quantaalpha.backtest.run_backtest",
             "-c", config_path,
             "--factor-source", req.factorSource,
-            "--factor-json", factor_json_str,
+            "--library-name", library_name,
             "--skip-uncached",
             "-v",
         ]
@@ -1108,7 +1055,7 @@ async def get_system_config():
         data={
             "env": masked_env,
             "experimentYaml": exp_yaml_content,
-            "factorLibraries": [Path(p).name for p in _find_factor_jsons()],
+            "factorLibraries": [lib["name"] for lib in _get_factor_libraries()],
         },
     )
 
@@ -1189,48 +1136,16 @@ async def ws_mining(websocket: WebSocket, task_id: str):
 
 def _update_mining_metrics(task: Dict[str, Any]):
     """
-    Update mining task metrics from the generated factor library.
+    Update mining task metrics from the SQLite factor library.
     Calculates best factor stats and extracts top 10 factors.
     """
-    jsons = _find_factor_jsons()
-    # Prefer library with matching suffix if configured
-    target_lib = None
+    manager = _get_manager()
     config = task.get("config", {})
     suffix = config.get("librarySuffix")
-    
-    if suffix:
-        candidate = PROJECT_ROOT / "data" / "factorlib" / f"all_factors_library_{suffix}.json"
-        # Fix: If suffix is specified, we ONLY look at this file.
-        # If it doesn't exist yet, it means no factors have been mined yet for this task.
-        if candidate.exists():
-            target_lib = str(candidate)
-        else:
-            # Task specific file not found -> assume empty state
-            return
-            
-    elif jsons:
-        # No suffix provided, fallback to latest existing library (legacy behavior)
-        target_lib = jsons[0]
-        
-    if not target_lib:
-        return
-
-    # Check modification time
-    try:
-        mtime = os.path.getmtime(target_lib)
-        created_at_str = task.get("createdAt")
-        if created_at_str:
-            created_at_dt = datetime.fromisoformat(created_at_str)
-            # Add a small buffer (e.g. 1 second) to avoid race conditions where file is created immediately
-            if mtime < created_at_dt.timestamp():
-                # File is older than the task -> ignore it
-                return
-    except Exception:
-        pass
+    library_name = suffix or "default"
 
     try:
-        lib = _load_factor_library(target_lib)
-        factors = lib.get("factors", {})
+        factors = manager.get_factors_by_library(library_name)
         
         # 1. Update basic stats
         total = len(factors)
@@ -1239,81 +1154,55 @@ def _update_mining_metrics(task: Dict[str, Any]):
         high = medium = low = 0
         factor_list = []
         
-        for f_id, f_info in factors.items():
-            # Check if this factor was created after task start
-            # If we are using a shared library file (unlikely with new logic, but possible if user forces it),
-            # we must ensure we don't display old factors.
-            try:
-                added_at_str = f_info.get("added_at", "")
-                created_at_str = task.get("createdAt", "")
-                if added_at_str and created_at_str:
-                    # Parse timestamps
-                    # added_at usually in isoformat
-                    added_at_dt = datetime.fromisoformat(added_at_str)
-                    created_at_dt = datetime.fromisoformat(created_at_str)
-                    if added_at_dt < created_at_dt:
-                        continue
-            except Exception:
-                pass # If date parsing fails, be permissive or conservative? Permissive for now.
+        for f_info in factors:
+            if not isinstance(f_info, dict):
+                continue
 
+            meta = f_info.get("metadata", {})
             bt = f_info.get("backtest_results", {})
             q = _classify_quality(bt)
             if q == "high": high += 1
             elif q == "medium": medium += 1
             else: low += 1
-            
-            # Prepare for top 10 list
-            # Normalize metrics
+
             ic = bt.get("IC", bt.get("1day.excess_return_without_cost.information_coefficient", 0))
             icir = bt.get("ICIR", bt.get("1day.excess_return_without_cost.information_coefficient_ir", 0))
             rank_ic = bt.get("Rank IC", bt.get("rank_ic", bt.get("1day.excess_return_without_cost.rank_ic", 0)))
             rank_icir = bt.get("Rank ICIR", bt.get("rank_ic_ir", bt.get("1day.excess_return_without_cost.rank_ic_ir", 0)))
-            
-            # Generate a mock equity curve for preview if real data is missing
-            # In production, this should come from actual backtest result files (CSV/H5)
-            # Here we generate a simple random walk with drift matching the annual return to show visual difference
+
             cumulative_curve = []
             annual_ret = bt.get("1day.excess_return_without_cost.annualized_return", 0)
-            max_dd = bt.get("1day.excess_return_with_cost.max_drawdown", 
-                                    bt.get("1day.excess_return_without_cost.max_drawdown", 0))
-            
-            # Calmar Ratio = Annual Return / Max Drawdown (absolute value)
-            # Avoid division by zero
+            max_dd = bt.get("1day.excess_return_with_cost.max_drawdown",
+                            bt.get("1day.excess_return_without_cost.max_drawdown", 0))
             cr = 0
             if max_dd < 0:
                 cr = annual_ret / abs(max_dd)
             elif max_dd > 0:
                 cr = annual_ret / max_dd
-            
-            # Simple simulation: 20 data points for preview sparkline
+
             import random
             current_val = 1.0
-            # Daily drift approx
             drift = (1 + annual_ret) ** (1/252) - 1 if annual_ret else 0
-            vol = 0.02 # Assumed daily vol
-            
-            # Use factor name hash to seed random for consistency
-            random.seed(hash(f_info.get("factor_name", f_id)))
-            
+            vol = 0.02
+            random.seed(hash(f_info.get("factor_name", "unknown")))
             for i in range(20):
-                 # Generate last 20 points
-                 ret = random.gauss(drift, vol)
-                 current_val *= (1 + ret)
-                 cumulative_curve.append({"value": current_val, "date": f"Day {i+1}"})
-            
+                ret = random.gauss(drift, vol)
+                current_val *= (1 + ret)
+                cumulative_curve.append({"value": current_val, "date": f"Day {i+1}"})
+
             factor_list.append({
-                "factorName": f_info.get("factor_name", f_id),
+                "factorName": f_info.get("factor_name", "unknown"),
                 "factorExpression": f_info.get("factor_expression", ""),
                 "rankIc": rank_ic,
                 "rankIcir": rank_icir,
                 "ic": ic,
                 "icir": icir,
                 "annualReturn": annual_ret,
-                "sharpeRatio": bt.get("1day.excess_return_with_cost.information_ratio", 
+                "sharpeRatio": bt.get("1day.excess_return_with_cost.information_ratio",
                                     bt.get("1day.excess_return_without_cost.information_ratio", 0)),
                 "maxDrawdown": max_dd,
                 "calmarRatio": cr,
-                "cumulativeCurve": cumulative_curve
+                "cumulativeCurve": cumulative_curve,
             })
 
         task["metrics"]["highQualityFactors"] = high

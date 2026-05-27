@@ -260,6 +260,38 @@ class CustomFactorCalculator:
             logger.warning(f"Factor computation failed [{factor_name}]: {str(e)[:200]}")
             return None
     
+    def calculate_factors_from_library(
+        self, library_name: str = "default", db_path: Optional[str] = None,
+        max_factors: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Batch compute factors from SQLite factor library."""
+        from quantaalpha.factors.library import FactorLibraryManager
+
+        manager = FactorLibraryManager(db_path)
+        raw_factors = manager.get_factors_by_library(library_name)
+
+        result = []
+        for finfo in raw_factors:
+            factor_expr = finfo.get("factor_expression", "")
+            if not factor_expr:
+                continue
+            factor_dict = {
+                "factor_id": finfo.get("factor_id"),
+                "factor_name": finfo.get("factor_name"),
+                "factor_expression": factor_expr,
+                "factor_description": finfo.get("factor_description", ""),
+            }
+            cloc = finfo.get("cache_location")
+            if cloc and cloc.get("result_h5_path"):
+                factor_dict["cache_location"] = cloc
+            result.append(factor_dict)
+
+        if max_factors and len(result) > max_factors:
+            result = result[:max_factors]
+
+        logger.debug(f"Loaded {len(result)} factors from SQLite library '{library_name}'")
+        return self.calculate_factors_batch(result)
+
     def calculate_factors_from_json(self, json_path: str, 
                                    max_factors: Optional[int] = None) -> pd.DataFrame:
         """Batch compute factors from JSON file."""

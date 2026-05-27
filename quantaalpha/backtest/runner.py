@@ -56,7 +56,8 @@ class BacktestRunner:
             factor_json: Optional[List[str]] = None,
             experiment_name: Optional[str] = None,
             output_name: Optional[str] = None,
-            skip_uncached: bool = False) -> Dict:
+            skip_uncached: bool = False,
+            library_name: Optional[str] = None) -> Dict:
         """Run full backtest; returns metrics dict."""
         start_time_total = time.time()
         self._init_qlib()
@@ -64,6 +65,8 @@ class BacktestRunner:
             self.config['factor_source']['type'] = factor_source
         if factor_json:
             self.config['factor_source']['custom']['json_files'] = factor_json
+        if library_name:
+            self.config['factor_source']['custom']['library_name'] = library_name
         
         if output_name is None and factor_json:
             output_name = Path(factor_json[0]).stem
@@ -72,7 +75,7 @@ class BacktestRunner:
         rec_name = self.config['experiment']['recorder']
 
         print(f"\n{'='*50}")
-        src = factor_json[0] if factor_json else exp_name
+        src = library_name or (factor_json[0] if factor_json else exp_name)
         print(f"Starting backtest: {src}")
         print(f"{'='*50}")
 

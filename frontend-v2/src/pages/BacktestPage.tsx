@@ -33,7 +33,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts';
-import { formatDate, formatNumber, formatPercent } from '@/utils';
+import { formatDate, formatPercent } from '@/utils';
 
 // ... (existing MetricCard component)
 
@@ -112,20 +112,9 @@ const CumulativeReturnChart: React.FC<{ data: { date: string; value: number }[] 
 };
 
 import { useTaskContext } from '@/context/TaskContext';
+import type { BacktestTask } from '@/context/TaskContext';
 
 // ========================== Component ==========================
-
-// Helper component for metrics
-const MetricCard = ({ label, value, unit = '' }: { label: string; value?: number; unit?: string }) => (
-  <div className="bg-secondary/30 rounded-lg p-3">
-    <div className="text-xs text-muted-foreground mb-1">{label}</div>
-    <div className="text-lg font-bold font-mono">
-      {typeof value === 'number' 
-        ? `${formatNumber(value, 4)}${unit}`
-        : '--'}
-    </div>
-  </div>
-);
 
 export const BacktestPage: React.FC = () => {
   const {
@@ -151,6 +140,17 @@ export const BacktestPage: React.FC = () => {
   const [cacheLoading, setCacheLoading] = useState(false);
   const [warmingCache, setWarmingCache] = useState(false);
   const [warmCacheResult, setWarmCacheResult] = useState<string | null>(null);
+
+  // Saved per-library backtest result (loaded from localStorage when no running task)
+  const BACKTEST_RESULT_PREFIX = 'quantaalpha_backtest_result_';
+  const [savedResult, setSavedResult] = useState<BacktestTask | null>(() => {
+    const lib = localStorage.getItem('quantaalpha_active_library') || '';
+    if (!lib) return null;
+    try {
+      const saved = localStorage.getItem(`${BACKTEST_RESULT_PREFIX}${lib}`);
+      return saved ? JSON.parse(saved) : null;
+    } catch { return null; }
+  });
 
   // -- Load libraries (on mount + manual refresh) --
   const [libsLoading, setLibsLoading] = useState(false);
@@ -205,6 +205,35 @@ export const BacktestPage: React.FC = () => {
     })();
   }, [selectedLibrary]);
 
+  // Sync library selector with running task's config
+  useEffect(() => {
+    if (task && task.config?.libraryName) {
+      setSelectedLibrary(task.config.libraryName);
+    }
+  }, [task?.taskId]);
+
+  // Load saved per-library result when selectedLibrary changes (if no running task)
+  useEffect(() => {
+    if (!selectedLibrary) {
+      setSavedResult(null);
+      return;
+    }
+    if (task && task.status === 'running') return;
+    try {
+      const saved = localStorage.getItem(`${BACKTEST_RESULT_PREFIX}${selectedLibrary}`);
+      setSavedResult(saved ? JSON.parse(saved) : null);
+    } catch {
+      setSavedResult(null);
+    }
+  }, [selectedLibrary, task?.status, task?.taskId]);
+
+  // Clear savedResult when a new task starts (non-null after being null)
+  useEffect(() => {
+    if (task && !['completed', 'failed', 'cancelled'].includes(task.status)) {
+      setSavedResult(null);
+    }
+  }, [task?.taskId]);
+
   // Auto-scroll logs
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -216,7 +245,7 @@ export const BacktestPage: React.FC = () => {
     setIsStarting(true);
     try {
       await startBacktestTask({
-        factorJson: selectedLibrary,
+        libraryName: selectedLibrary,
         factorSource,
       });
     } catch (err: any) {
@@ -266,7 +295,10 @@ export const BacktestPage: React.FC = () => {
   }
 
   const isRunning = task?.status === 'running';
-  const isFinished = task?.status === 'completed' || task?.status === 'failed' || task?.status === 'cancelled';
+  const hasSavedResult = !isRunning && savedResult != null;
+  const displayTask = isRunning ? task : (hasSavedResult ? savedResult : null);
+  const displayLogs = hasSavedResult ? (savedResult.logs || []) : logs;
+  const isFinished = displayTask?.status === 'completed';
 
   // -- Render metric card --
   const MetricCard = ({ label, value, unit }: { label: string; value: any; unit?: string }) => (
@@ -279,8 +311,8 @@ export const BacktestPage: React.FC = () => {
     </div>
   );
 
-  // Extract metrics from task
-  const metrics = task?.metrics || {};
+  // Extract metrics from display task
+  const metrics = displayTask?.metrics || {};
 
   return (
     <div className="space-y-6 animate-fade-in-up">
@@ -532,7 +564,7 @@ export const BacktestPage: React.FC = () => {
       </Card>
 
       {/* Progress + Status */}
-      {task && (
+      {displayTask && (
         <Card className={`glass card-hover ${isRunning ? 'border-primary/50' : ''}`}>
           <CardHeader>
             <CardTitle className="flex items-center justify-between">
@@ -542,26 +574,26 @@ export const BacktestPage: React.FC = () => {
                     <div className="absolute inset-0 rounded-full bg-primary/30 animate-ping" />
                     <BarChart3 className="relative h-5 w-5 text-primary" />
                   </div>
-                ) : task.status === 'completed' ? (
+                ) : displayTask.status === 'completed' ? (
                   <CheckCircle2 className="h-5 w-5 text-green-500" />
-                ) : task.status === 'failed' ? (
+                ) : displayTask.status === 'failed' ? (
                   <AlertCircle className="h-5 w-5 text-red-500" />
                 ) : (
                   <Clock className="h-5 w-5" />
                 )}
-                回测进度
+                 回测进度
               </div>
               <Badge
                 variant={
-                  task.status === 'completed' ? 'default' :
-                  task.status === 'running' ? 'default' :
-                  task.status === 'failed' ? 'destructive' : 'outline'
+                  displayTask.status === 'completed' ? 'default' :
+                  displayTask.status === 'running' ? 'default' :
+                  displayTask.status === 'failed' ? 'destructive' : 'outline'
                 }
               >
-                {task.status === 'running' ? '运行中' :
-                 task.status === 'completed' ? '已完成' :
-                 task.status === 'failed' ? '失败' :
-                 task.status === 'cancelled' ? '已取消' : task.status}
+                {displayTask.status === 'running' ? '运行中' :
+                 displayTask.status === 'completed' ? '已完成' :
+                 displayTask.status === 'failed' ? '失败' :
+                 displayTask.status === 'cancelled' ? '已取消' : displayTask.status}
               </Badge>
             </CardTitle>
           </CardHeader>
@@ -575,7 +607,7 @@ export const BacktestPage: React.FC = () => {
                     回测正在执行中
                   </p>
                   <p className="text-xs text-muted-foreground truncate">
-                    {task.progress?.message || '正在加载因子数据并训练模型...'}
+                    {displayTask.progress?.message || '正在加载因子数据并训练模型...'}
                   </p>
                 </div>
               </div>
@@ -584,16 +616,16 @@ export const BacktestPage: React.FC = () => {
             {/* Progress bar */}
             <div className="mb-4">
               <div className="flex justify-between text-sm mb-1">
-                <span className="text-muted-foreground">{task.progress?.message || '等待中...'}</span>
+                <span className="text-muted-foreground">{displayTask.progress?.message || '等待中...'}</span>
                 <span className="text-muted-foreground">
-                  {task.status === 'completed' ? '100%' :
-                   task.status === 'failed' ? '失败' :
-                   task.progress?.progress > 0 ? `${Math.round(task.progress.progress)}%` :
+                  {displayTask.status === 'completed' ? '100%' :
+                   displayTask.status === 'failed' ? '失败' :
+                   displayTask.progress?.progress > 0 ? `${Math.round(displayTask.progress.progress)}%` :
                    isRunning ? '运行中...' : ''}
                 </span>
               </div>
               <div className="h-2 bg-secondary rounded-full overflow-hidden">
-                {isRunning && (!task.progress?.progress || task.progress.progress <= 0) ? (
+                {isRunning && (!displayTask.progress?.progress || displayTask.progress.progress <= 0) ? (
                   /* Indeterminate shimmer animation when no progress % */
                   <div
                     className="h-full w-1/3 rounded-full bg-gradient-to-r from-transparent via-primary to-transparent"
@@ -604,14 +636,14 @@ export const BacktestPage: React.FC = () => {
                 ) : (
                   <div
                     className={`h-full rounded-full transition-all duration-500 ${
-                      task.status === 'completed' ? 'bg-green-500' :
-                      task.status === 'failed' ? 'bg-red-500' :
+                      displayTask.status === 'completed' ? 'bg-green-500' :
+                      displayTask.status === 'failed' ? 'bg-red-500' :
                       'bg-primary'
                     }`}
                     style={{
-                      width: task.status === 'completed' ? '100%' :
-                             task.status === 'failed' ? '100%' :
-                             task.progress?.progress > 0 ? `${task.progress.progress}%` :
+                      width: displayTask.status === 'completed' ? '100%' :
+                             displayTask.status === 'failed' ? '100%' :
+                             displayTask.progress?.progress > 0 ? `${displayTask.progress.progress}%` :
                              '0%',
                     }}
                   />
@@ -621,17 +653,17 @@ export const BacktestPage: React.FC = () => {
 
             {/* Task info */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-muted-foreground">
-              <div>任务 ID: <span className="font-mono text-foreground">{task.taskId}</span></div>
-              <div>开始时间: {new Date(task.createdAt).toLocaleTimeString()}</div>
-              <div>因子库: {task.config?.factorJson || selectedLibrary}</div>
-              <div>因子源: {task.config?.factorSource || factorSource}</div>
+              <div>任务 ID: <span className="font-mono text-foreground">{displayTask.taskId}</span></div>
+              <div>开始时间: {new Date(displayTask.createdAt).toLocaleTimeString()}</div>
+              <div>因子库: {displayTask.config?.libraryName || selectedLibrary}</div>
+              <div>因子源: {displayTask.config?.factorSource || factorSource}</div>
             </div>
           </CardContent>
         </Card>
       )}
 
       {/* Results */}
-      {isFinished && task?.status === 'completed' && Object.keys(metrics).length > 0 && (
+      {isFinished && Object.keys(metrics).length > 0 && (
         <Card className="glass card-hover animate-fade-in-up">
           <CardHeader>
             <CardTitle className="flex items-center justify-between">
@@ -681,7 +713,7 @@ export const BacktestPage: React.FC = () => {
       )}
 
       {/* Logs Panel */}
-      {(logs.length > 0 || isRunning) && (
+      {(logs.length > 0 || displayLogs.length > 0 || isRunning) && (
         <Card className="glass card-hover">
           <CardHeader>
             <CardTitle className="flex items-center justify-between">
@@ -690,19 +722,19 @@ export const BacktestPage: React.FC = () => {
                 运行日志
               </span>
               <span className="text-xs text-muted-foreground font-normal">
-                {logs.length} 条日志
+                {displayLogs.length} 条日志
               </span>
             </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="bg-black/50 rounded-lg p-4 max-h-[400px] overflow-y-auto font-mono text-xs">
-              {logs.length === 0 && isRunning && (
+              {displayLogs.length === 0 && isRunning && (
                 <div className="text-muted-foreground flex items-center gap-2">
                   <Loader2 className="h-3 w-3 animate-spin" />
                   等待日志输出...
                 </div>
               )}
-              {logs.map((log) => (
+              {displayLogs.map((log) => (
                 <div key={log.id} className="py-0.5 flex gap-2">
                   <span className="text-muted-foreground whitespace-nowrap">
                     {new Date(log.timestamp).toLocaleTimeString()}

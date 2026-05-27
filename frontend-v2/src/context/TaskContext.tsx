@@ -52,6 +52,7 @@ const MINING_TASK_DATA_KEY = 'quantaalpha_mining_task_data';
 const BACKTEST_TASK_ID_KEY = 'quantaalpha_backtest_task_id';
 const BACKTEST_TASK_DATA_KEY = 'quantaalpha_backtest_task_data';
 const BACKTEST_LOGS_KEY = 'quantaalpha_backtest_logs';
+const BACKTEST_RESULT_PREFIX = 'quantaalpha_backtest_result_';
 
 // ========================== Context Value ==========================
 
@@ -807,6 +808,14 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       localStorage.setItem(BACKTEST_TASK_DATA_KEY, JSON.stringify(backtestTask));
       if (backtestTask.status === 'completed' || backtestTask.status === 'failed' || backtestTask.status === 'cancelled') {
         localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+        // Save result per-library for later retrieval
+        const library = backtestTask.config?.libraryName;
+        if (library) {
+          localStorage.setItem(
+            `${BACKTEST_RESULT_PREFIX}${library}`,
+            JSON.stringify(backtestTask),
+          );
+        }
       }
     }
   }, [backtestTask?.status, backtestLogs?.length]);

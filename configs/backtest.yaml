@@ -24,8 +24,12 @@ factor_source:
   # type: alpha158 | alpha158_20 | alpha360 | custom | combined
   type: "alpha158_20"
 
-  # Custom factor library (when type is "custom" or "combined")
+  # Custom factor library from SQLite (when type is "custom" or "combined")
   custom:
+    # SQLite mode (new default, replaces json_files)
+    library_name: "default"
+    # db_path: "data/factorlib/factor_library.db"  # optional, uses DEFAULT_DB_PATH env or default
+    # JSON fallback (legacy)
     json_files: []
     # quality_filter: high_quality | medium_quality | low_quality | null
     quality_filter: null

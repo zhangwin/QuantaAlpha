@@ -138,7 +138,7 @@ export async function warmCache(library?: string) {
 // ========================== Backtest API ==========================
 
 export interface BacktestStartParams {
-  factorJson: string;
+  libraryName: string;
   factorSource?: string;
   configPath?: string;
 }

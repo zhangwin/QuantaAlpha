@@ -78,12 +78,11 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
              metrics={task.metrics || null} 
              onBacktest={() => {
                // Set active library for backtest page
-               if (task.config?.librarySuffix) {
-                 const libName = `all_factors_library_${task.config.librarySuffix}.json`;
-                 localStorage.setItem('quantaalpha_active_library', libName);
-               } else {
-                 localStorage.setItem('quantaalpha_active_library', 'all_factors_library.json');
-               }
+                if (task.config?.librarySuffix) {
+                  localStorage.setItem('quantaalpha_active_library', task.config.librarySuffix);
+                } else {
+                  localStorage.setItem('quantaalpha_active_library', 'default');
+                }
                onNavigate?.('backtest');
              }}
            />

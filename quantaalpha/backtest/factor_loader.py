@@ -324,29 +324,66 @@ class FactorLoader:
         return alpha360_factors
     
     def _load_custom_factors(self) -> Tuple[Dict[str, str], List[Dict]]:
-        """Load custom factor library; all factors use custom calculator (expr_parser + function_lib). Returns ({}, custom_factors)."""
+        """Load custom factor library; supports SQLite (default) or JSON (legacy). Returns ({}, custom_factors)."""
         custom_config = self.factor_source_config.get('custom', {})
-        json_files = custom_config.get('json_files', [])
-        quality_filter = custom_config.get('quality_filter')
         max_factors = custom_config.get('max_factors')
-        
-        custom_factors = []
-        
-        for json_file in json_files:
-            file_path = Path(json_file)
-            if not file_path.exists():
-                logger.warning(f"  Factor library file not found: {json_file}")
+
+        # SQLite mode (new default)
+        library_name = custom_config.get('library_name')
+        if library_name:
+            factors = self._load_custom_factors_from_db(
+                db_path=custom_config.get('db_path'),
+                library_name=library_name,
+            )
+        else:
+            # JSON fallback (legacy, for migration)
+            json_files = custom_config.get('json_files', [])
+            quality_filter = custom_config.get('quality_filter')
+            factors = []
+            for json_file in json_files:
+                file_path = Path(json_file)
+                if not file_path.exists():
+                    logger.warning(f"  Factor library file not found: {json_file}")
+                    continue
+                factors.extend(self._parse_all_factors_from_json(file_path, quality_filter))
+
+        if max_factors and len(factors) > max_factors:
+            factors = factors[:max_factors]
+
+        logger.debug(f"  Load custom factors: {len(factors)} (custom calculator)")
+        return {}, factors
+
+    def _load_custom_factors_from_db(
+        self, db_path: Optional[str] = None, library_name: str = "default"
+    ) -> List[Dict]:
+        """Load factors from SQLite factor library."""
+        from quantaalpha.factors.library import FactorLibraryManager
+
+        try:
+            manager = FactorLibraryManager(db_path)
+            raw_factors = manager.get_factors_by_library(library_name)
+        except Exception as e:
+            logger.warning(f"Failed to load from SQLite: {e}")
+            return []
+
+        result = []
+        for finfo in raw_factors:
+            factor_expr = finfo.get("factor_expression", "")
+            if not factor_expr:
                 continue
-            
-            factors = self._parse_all_factors_from_json(file_path, quality_filter)
-            custom_factors.extend(factors)
-        
-        if max_factors and len(custom_factors) > max_factors:
-            custom_factors = custom_factors[:max_factors]
-        
-        logger.debug(f"  Load custom factors: {len(custom_factors)} (custom calculator)")
-        
-        return {}, custom_factors
+            factor_dict = {
+                "factor_id": finfo.get("factor_id"),
+                "factor_name": finfo.get("factor_name"),
+                "factor_expression": factor_expr,
+                "factor_description": finfo.get("factor_description", ""),
+            }
+            cloc = finfo.get("cache_location")
+            if cloc and cloc.get("result_h5_path"):
+                factor_dict["cache_location"] = cloc
+            result.append(factor_dict)
+
+        logger.debug(f"  Loaded {len(result)} factors from SQLite library '{library_name}'")
+        return result
     
     def _parse_all_factors_from_json(self, file_path: Path, 
                                      quality_filter: Optional[str] = None) -> List[Dict]:

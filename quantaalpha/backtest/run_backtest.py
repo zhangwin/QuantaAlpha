@@ -2,8 +2,9 @@
 """
 Backtest entry script. Usage:
   quantaalpha backtest --factor-source alpha158_20
-  quantaalpha backtest --factor-source custom --factor-json /path/to/factors.json
+  quantaalpha backtest --factor-source custom --library-name default
   python -m quantaalpha.backtest.run_backtest -c configs/backtest.yaml --factor-source alpha158_20
+  python -m quantaalpha.backtest.run_backtest -c configs/backtest.yaml --factor-source custom --library-name default
 """
 
 import argparse
@@ -39,6 +40,7 @@ def main():
         epilog="""
 Examples:
   python run_backtest.py -c config.yaml --factor-source alpha158_20
+  python run_backtest.py -c config.yaml --factor-source custom --library-name default
   python run_backtest.py -c config.yaml --factor-source custom --factor-json /path/to/factors.json
   python run_backtest.py -c config.yaml --factor-source combined --factor-json f1.json --factor-json f2.json
         """
@@ -48,7 +50,9 @@ Examples:
                         choices=['alpha158', 'alpha158_20', 'alpha360', 'custom', 'combined'],
                         default=None, help='Factor source type (overrides config)')
     parser.add_argument('-j', '--factor-json', type=str, action='append', default=None,
-                        help='Custom factor JSON path (can repeat)')
+                        help='Custom factor JSON path (can repeat, legacy)')
+    parser.add_argument('-l', '--library-name', type=str, default=None,
+                        help='Factor library name from SQLite (e.g. "default", "exp_xxx")')
     parser.add_argument('-e', '--experiment', type=str, default=None, help='Experiment name (overrides config)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
     parser.add_argument('--dry-run', action='store_true', help='Load factors only, no backtest')
@@ -63,10 +67,8 @@ Examples:
     if not config_path.exists():
         logger.error(f"Config file not found: {config_path}")
         sys.exit(1)
-    if args.factor_source == 'custom' and not args.factor_json:
-        parser.error("--factor-source custom requires --factor-json")
-    if args.factor_source == 'combined' and not args.factor_json:
-        parser.error("--factor-source combined requires --factor-json")
+    if args.factor_source == 'custom' and not (args.factor_json or args.library_name):
+        parser.error("--factor-source custom requires --library-name or --factor-json")
     
     try:
         from quantaalpha.backtest.runner import BacktestRunner
@@ -80,6 +82,8 @@ Examples:
                 runner.config['factor_source']['type'] = args.factor_source
             if args.factor_json:
                 runner.config['factor_source']['custom']['json_files'] = args.factor_json
+            if args.library_name:
+                runner.config['factor_source']['custom']['library_name'] = args.library_name
             
             loader = FactorLoader(runner.config)
             qlib_factors, custom_factors = loader.load_factors()
@@ -101,6 +105,7 @@ Examples:
                 factor_json=args.factor_json,
                 experiment_name=args.experiment,
                 skip_uncached=args.skip_uncached,
+                library_name=args.library_name,
             )
             
     except KeyboardInterrupt:
