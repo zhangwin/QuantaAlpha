@@ -132,6 +132,7 @@ export const BacktestPage: React.FC = () => {
     backendAvailable,
     backtestTask: task,
     backtestLogs: logs,
+    backtestIsRestoring,
     startBacktestTask,
     stopBacktestTask,
   } = useTaskContext();
@@ -251,6 +252,18 @@ export const BacktestPage: React.FC = () => {
     }
     setWarmingCache(false);
   };
+
+  // Show loading while restoring task from backend
+  if (backtestIsRestoring) {
+    return (
+      <div className="flex h-[60vh] items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <Loader2 className="h-10 w-10 animate-spin text-primary" />
+          <p className="text-muted-foreground text-sm">正在恢复回测任务...</p>
+        </div>
+      </div>
+    );
+  }
 
   const isRunning = task?.status === 'running';
   const isFinished = task?.status === 'completed' || task?.status === 'failed' || task?.status === 'cancelled';

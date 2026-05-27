@@ -11,20 +11,25 @@ import { TaskProvider, useTaskContext } from '@/context/TaskContext';
 
 // Inner component to access context
 const AppContent: React.FC = () => {
-  const [currentPage, setCurrentPage] = useState<PageId>('home');
-  const { miningTask } = useTaskContext();
+  // Check localStorage synchronously so we immediately show dashboard if a task was in progress
+  const savedMiningTaskId = localStorage.getItem('quantaalpha_mining_task_id');
+  const savedBacktestTaskId = localStorage.getItem('quantaalpha_backtest_task_id');
+  const initialPage: PageId = savedMiningTaskId ? 'mining_dashboard' : savedBacktestTaskId ? 'backtest' : 'home';
+  const [currentPage, setCurrentPage] = useState<PageId>(initialPage);
+  const { miningTask, backtestTask } = useTaskContext();
 
-  // Auto-switch to dashboard when task starts
+  // Auto-switch to dashboard when a task newly appears (restore completed or new start)
   useEffect(() => {
-    if (miningTask && miningTask.status === 'running' && currentPage === 'home') {
-       // Only auto-redirect if we are on home and a new task starts
-       // But wait, user requirement says: "Don't disconnect when going back to home"
-       // So we should redirect to dashboard ONLY when a NEW task is created via ChatInput
-       // The ChatInput in HomePage calls startMining.
-       // We can detect this change.
+    if (miningTask && currentPage === 'home') {
        setCurrentPage('mining_dashboard');
     }
-  }, [miningTask?.taskId]); // Only trigger on new task ID
+  }, [miningTask?.taskId]);
+
+  useEffect(() => {
+    if (backtestTask && currentPage === 'home') {
+      setCurrentPage('backtest');
+    }
+  }, [backtestTask?.taskId]);
 
   return (
     <>

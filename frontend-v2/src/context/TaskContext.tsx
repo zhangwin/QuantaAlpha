@@ -46,6 +46,13 @@ export interface BacktestTask {
   updatedAt: string;
 }
 
+// localStorage keys for persisting tasks across page refreshes
+const MINING_TASK_ID_KEY = 'quantaalpha_mining_task_id';
+const MINING_TASK_DATA_KEY = 'quantaalpha_mining_task_data';
+const BACKTEST_TASK_ID_KEY = 'quantaalpha_backtest_task_id';
+const BACKTEST_TASK_DATA_KEY = 'quantaalpha_backtest_task_data';
+const BACKTEST_LOGS_KEY = 'quantaalpha_backtest_logs';
+
 // ========================== Context Value ==========================
 
 interface TaskContextValue {
@@ -54,6 +61,7 @@ interface TaskContextValue {
 
   // ---- Mining ----
   miningTask: Task | null;
+  isRestoring: boolean;
   miningEquityCurve: TimeSeriesData[];
   miningDrawdownCurve: TimeSeriesData[];
   miningIcTimeSeries: TimeSeriesData[];
@@ -64,6 +72,7 @@ interface TaskContextValue {
   // ---- Backtest ----
   backtestTask: BacktestTask | null;
   backtestLogs: LogEntry[];
+  backtestIsRestoring: boolean;
   startBacktestTask: (params: BacktestStartParams) => Promise<void>;
   stopBacktestTask: () => void;
 }
@@ -85,7 +94,17 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ==================================================================
   // MINING
   // ==================================================================
-  const [miningTask, setMiningTask] = useState<Task | null>(null);
+  // Attempt to restore from localStorage immediately (synchronous)
+  const [miningTask, setMiningTask] = useState<Task | null>(
+    (() => {
+      const saved = localStorage.getItem(MINING_TASK_DATA_KEY);
+      if (saved) {
+        try { return JSON.parse(saved) as Task; } catch {}
+      }
+      return null;
+    })()
+  );
+  const [isRestoring, setIsRestoring] = useState(!!localStorage.getItem(MINING_TASK_ID_KEY));
   const [miningEquityCurve, setMiningEquityCurve] = useState<TimeSeriesData[]>([]);
   const [miningDrawdownCurve, setMiningDrawdownCurve] = useState<TimeSeriesData[]>([]);
   const [miningIcTimeSeries, setMiningIcTimeSeries] = useState<TimeSeriesData[]>([]);
@@ -218,6 +237,98 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [pushMiningDataPoint],
   );
 
+  // Restore mining task from localStorage on mount (survives page refresh)
+  // Task data is restored synchronously in useState above.
+  // This effect verifies with backend & reconnects WebSocket.
+  const restoreAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (restoreAttemptedRef.current) return;
+    restoreAttemptedRef.current = true;
+
+    const savedTaskId = localStorage.getItem(MINING_TASK_ID_KEY);
+    if (!savedTaskId) {
+      setIsRestoring(false);
+      return;
+    }
+
+    // Helper to clear stale cached task
+    const clearStaleTask = () => {
+      localStorage.removeItem(MINING_TASK_ID_KEY);
+      localStorage.removeItem(MINING_TASK_DATA_KEY);
+      setMiningTask(null);
+    };
+
+    getMiningStatus(savedTaskId).then((resp) => {
+      setIsRestoring(false);
+      if (!resp.success || !resp.data?.task) {
+        // Backend no longer has this task — clear cache
+        clearStaleTask();
+        return;
+      }
+      const task = resp.data.task as Task;
+      setMiningTask(task);
+      // Refresh cached data
+      localStorage.setItem(MINING_TASK_DATA_KEY, JSON.stringify(task));
+
+      if (task.status === 'completed' || task.status === 'failed') {
+        localStorage.removeItem(MINING_TASK_ID_KEY);
+        return;
+      }
+      // Reconnect WebSocket for running tasks
+      const ws = connectMiningWs(
+        savedTaskId,
+        handleMiningWsMessage,
+        () => {
+          getMiningStatus(savedTaskId).then((r) => {
+            if (r.data?.task) setMiningTask(r.data.task as Task);
+          });
+        },
+      );
+      miningWsRef.current = ws;
+      // Start polling — always sync task state (logs, progress, metrics)
+      miningPollingRef.current = setInterval(async () => {
+        try {
+          const r = await getMiningStatus(savedTaskId);
+          if (r.data?.task) {
+            const t = r.data.task as Task;
+            setMiningTask(t);
+            localStorage.setItem(MINING_TASK_DATA_KEY, JSON.stringify(t));
+            if (t.status === 'completed' || t.status === 'failed') {
+              clearInterval(miningPollingRef.current!);
+              miningPollingRef.current = null;
+              localStorage.removeItem(MINING_TASK_ID_KEY);
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 10000);
+    }).catch(async () => {
+      setIsRestoring(false);
+      // Check if backend is alive
+      try {
+        const healthResp = await fetch('/api/health');
+        if (healthResp.ok) {
+          // Backend is up but task doesn't exist (404) — clear stale cache
+          clearStaleTask();
+        }
+        // else backend is unreachable — keep cached data as fallback
+      } catch {
+        // Backend unreachable — keep cached data
+      }
+    });
+  }, [handleMiningWsMessage]);
+
+  // Keep cached task data in sync, and clear taskId when terminal
+  useEffect(() => {
+    if (miningTask) {
+      localStorage.setItem(MINING_TASK_DATA_KEY, JSON.stringify(miningTask));
+      if (miningTask.status === 'completed' || miningTask.status === 'failed') {
+        localStorage.removeItem(MINING_TASK_ID_KEY);
+      }
+    }
+  }, [miningTask?.status, miningTask?.logs?.length]);
+
   // Start mining (real backend)
   const startRealMining = useCallback(
     async (config: TaskConfig) => {
@@ -259,6 +370,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setMiningDrawdownCurve([]);
         setMiningIcTimeSeries([]);
         miningDataPointsRef.current = 0;
+        // Persist taskId + full task data so it survives page refresh
+        localStorage.setItem(MINING_TASK_ID_KEY, resp.data.taskId);
+        localStorage.setItem(MINING_TASK_DATA_KEY, JSON.stringify(taskData));
 
         // WebSocket
         const ws = connectMiningWs(
@@ -272,14 +386,15 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         );
         miningWsRef.current = ws;
 
-        // Polling fallback
+        // Polling fallback — always sync task state
         miningPollingRef.current = setInterval(async () => {
           try {
             const r = await getMiningStatus(resp.data!.taskId);
             if (r.data?.task) {
               const t = r.data.task as Task;
+              setMiningTask(t);
+              localStorage.setItem(MINING_TASK_DATA_KEY, JSON.stringify(t));
               if (t.status === 'completed' || t.status === 'failed') {
-                setMiningTask(t);
                 clearInterval(miningPollingRef.current!);
                 miningPollingRef.current = null;
               }
@@ -430,6 +545,8 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // ignore
       }
     }
+    localStorage.removeItem(MINING_TASK_ID_KEY);
+    localStorage.removeItem(MINING_TASK_DATA_KEY);
     setMiningTask((prev) => (prev ? { ...prev, status: 'failed' } : prev));
   }, [miningTask, backendAvailable]);
 
@@ -442,6 +559,8 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
       clearInterval(miningPollingRef.current);
       miningPollingRef.current = null;
     }
+    localStorage.removeItem(MINING_TASK_ID_KEY);
+    localStorage.removeItem(MINING_TASK_DATA_KEY);
     setMiningTask(null);
     setMiningEquityCurve([]);
     setMiningDrawdownCurve([]);
@@ -451,8 +570,25 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ==================================================================
   // BACKTEST
   // ==================================================================
-  const [backtestTask, setBacktestTask] = useState<BacktestTask | null>(null);
-  const [backtestLogs, setBacktestLogs] = useState<LogEntry[]>([]);
+  const [backtestTask, setBacktestTask] = useState<BacktestTask | null>(
+    (() => {
+      const saved = localStorage.getItem(BACKTEST_TASK_DATA_KEY);
+      if (saved) {
+        try { return JSON.parse(saved) as BacktestTask; } catch {}
+      }
+      return null;
+    })()
+  );
+  const [backtestLogs, setBacktestLogs] = useState<LogEntry[]>(
+    (() => {
+      const saved = localStorage.getItem(BACKTEST_LOGS_KEY);
+      if (saved) {
+        try { return JSON.parse(saved) as LogEntry[]; } catch {}
+      }
+      return [];
+    })()
+  );
+  const [backtestIsRestoring, setBacktestIsRestoring] = useState(!!localStorage.getItem(BACKTEST_TASK_ID_KEY));
 
   const backtestWsRef = useRef<WebSocket | null>(null);
   const backtestPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -507,6 +643,10 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const taskData = resp.data.task as unknown as BacktestTask;
       setBacktestTask(taskData);
+      // Persist to localStorage
+      localStorage.setItem(BACKTEST_TASK_ID_KEY, resp.data.taskId);
+      localStorage.setItem(BACKTEST_TASK_DATA_KEY, JSON.stringify(taskData));
+      localStorage.setItem(BACKTEST_LOGS_KEY, '[]');
 
       // WebSocket
       const ws = connectMiningWs(
@@ -543,7 +683,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
               // Final update: sync task + logs from backend (in case WS missed some)
               setBacktestTask(t);
               if (t.logs && t.logs.length > 0) {
-                setBacktestLogs(t.logs.slice(-500));
+                const recentLogs = t.logs.slice(-500);
+                setBacktestLogs(recentLogs);
+                localStorage.setItem(BACKTEST_LOGS_KEY, JSON.stringify(recentLogs));
               }
               clearInterval(backtestPollingRef.current!);
               backtestPollingRef.current = null;
@@ -571,8 +713,103 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch {
       // ignore
     }
+    localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+    localStorage.removeItem(BACKTEST_TASK_DATA_KEY);
+    localStorage.removeItem(BACKTEST_LOGS_KEY);
     setBacktestTask((prev) => (prev ? { ...prev, status: 'cancelled' } : prev));
   }, [backtestTask]);
+
+  // ---- Backtest restore on mount ----
+  const backtestRestoreAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (backtestRestoreAttemptedRef.current) return;
+    backtestRestoreAttemptedRef.current = true;
+
+    const savedTaskId = localStorage.getItem(BACKTEST_TASK_ID_KEY);
+    if (!savedTaskId) {
+      setBacktestIsRestoring(false);
+      return;
+    }
+
+    const clearStaleBacktest = () => {
+      localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+      localStorage.removeItem(BACKTEST_TASK_DATA_KEY);
+      localStorage.removeItem(BACKTEST_LOGS_KEY);
+      setBacktestTask(null);
+      setBacktestLogs([]);
+    };
+
+    getBacktestStatus(savedTaskId).then((resp) => {
+      setBacktestIsRestoring(false);
+      if (!resp.success || !resp.data?.task) {
+        clearStaleBacktest();
+        return;
+      }
+      const task = resp.data.task as unknown as BacktestTask;
+      setBacktestTask(task);
+      localStorage.setItem(BACKTEST_TASK_DATA_KEY, JSON.stringify(task));
+      if (task.logs?.length) {
+        setBacktestLogs(task.logs.slice(-500));
+        localStorage.setItem(BACKTEST_LOGS_KEY, JSON.stringify(task.logs.slice(-500)));
+      }
+
+      if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+        localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+        return;
+      }
+      // Reconnect WebSocket for running tasks
+      const ws = connectMiningWs(
+        savedTaskId,
+        handleBacktestWsMessage,
+        () => {
+          getBacktestStatus(savedTaskId).then((r) => {
+            if (r.data?.task) setBacktestTask(r.data.task as unknown as BacktestTask);
+          });
+        },
+      );
+      backtestWsRef.current = ws;
+      // Polling
+      backtestPollingRef.current = setInterval(async () => {
+        try {
+          const r = await getBacktestStatus(savedTaskId);
+          if (r.data?.task) {
+            const t = r.data.task as unknown as BacktestTask;
+            setBacktestTask((prev) => {
+              if (!prev) return t;
+              return { ...prev, status: t.status, progress: t.progress || prev.progress, metrics: t.metrics || prev.metrics, updatedAt: t.updatedAt };
+            });
+            if (t.logs?.length) {
+              setBacktestLogs(t.logs.slice(-500));
+              localStorage.setItem(BACKTEST_LOGS_KEY, JSON.stringify(t.logs.slice(-500)));
+            }
+            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
+              setBacktestTask(t);
+              if (t.logs?.length) setBacktestLogs(t.logs.slice(-500));
+              clearInterval(backtestPollingRef.current!);
+              backtestPollingRef.current = null;
+              localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+            }
+          }
+        } catch { /* ignore */ }
+      }, 5000);
+    }).catch(async () => {
+      setBacktestIsRestoring(false);
+      try {
+        const healthResp = await fetch('/api/health');
+        if (healthResp.ok) clearStaleBacktest();
+      } catch { /* ignore */ }
+    });
+  }, [handleBacktestWsMessage]);
+
+  // Keep backtest state synced to localStorage
+  useEffect(() => {
+    if (backtestTask) {
+      localStorage.setItem(BACKTEST_TASK_DATA_KEY, JSON.stringify(backtestTask));
+      if (backtestTask.status === 'completed' || backtestTask.status === 'failed' || backtestTask.status === 'cancelled') {
+        localStorage.removeItem(BACKTEST_TASK_ID_KEY);
+      }
+    }
+  }, [backtestTask?.status, backtestLogs?.length]);
 
   // ==================================================================
   // Context value
@@ -581,6 +818,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     backendAvailable,
     // Mining
     miningTask,
+    isRestoring,
     miningEquityCurve,
     miningDrawdownCurve,
     miningIcTimeSeries,
@@ -591,6 +829,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // ---- Backtest ----
     backtestTask,
     backtestLogs,
+    backtestIsRestoring,
     startBacktestTask,
     stopBacktestTask,
   };

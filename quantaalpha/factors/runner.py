@@ -105,7 +105,8 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                             # Ensure symlink exists
                             data_source = Path(FACTOR_COSTEER_SETTINGS.data_folder).absolute()
                             if not data_source.is_absolute():
-                                data_source = Path(__file__).parent.parent.parent.parent.parent / FACTOR_COSTEER_SETTINGS.data_folder
+                                project_root = Path(__file__).parent.parent.parent
+                                data_source = project_root / FACTOR_COSTEER_SETTINGS.data_folder
                             daily_pv_link = ws.workspace_path / "daily_pv.h5"
                             if not daily_pv_link.exists() and (data_source / "daily_pv.h5").exists():
                                 os.symlink(str(data_source / "daily_pv.h5"), str(daily_pv_link))
@@ -113,7 +114,7 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                             # Execute factor
                             import subprocess
                             env = os.environ.copy()
-                            project_root = Path(__file__).parent.parent.parent.parent.parent
+                            project_root = Path(__file__).parent.parent.parent
                             env['PYTHONPATH'] = str(project_root) + os.pathsep + env.get('PYTHONPATH', '')
                             subprocess.check_output(
                                 [sys.executable, str(ws.workspace_path / 'factor.py')],

@@ -15,13 +15,14 @@ interface MiningDashboardPageProps {
 export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavigate }) => {
   const {
     miningTask: task,
+    isRestoring,
     miningEquityCurve: equityCurve,
     miningDrawdownCurve: drawdownCurve,
     startMining,
     stopMining,
   } = useTaskContext();
 
-  // If no task, this page shouldn't be active (or show empty state)
+  // If no task, show appropriate message
   if (!task) {
     return (
       <Layout
@@ -30,13 +31,22 @@ export const MiningDashboardPage: React.FC<MiningDashboardPageProps> = ({ onNavi
         showNavigation={!!onNavigate}
       >
         <div className="flex flex-col items-center justify-center min-h-[60vh] animate-fade-in-up">
-          <p className="text-muted-foreground">当前无进行中的挖掘任务</p>
-          <button 
-            className="mt-4 text-primary hover:underline"
-            onClick={() => onNavigate?.('home')}
-          >
-            返回主页
-          </button>
+          {isRestoring ? (
+            <>
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-4" />
+              <p className="text-muted-foreground">正在恢复上次的挖掘任务...</p>
+            </>
+          ) : (
+            <>
+              <p className="text-muted-foreground">当前无进行中的挖掘任务</p>
+              <button 
+                className="mt-4 text-primary hover:underline"
+                onClick={() => onNavigate?.('home')}
+              >
+                返回主页
+              </button>
+            </>
+          )}
         </div>
       </Layout>
     );

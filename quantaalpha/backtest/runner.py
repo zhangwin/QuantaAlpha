@@ -246,11 +246,45 @@ class BacktestRunner:
                 elif name == 'instrument' or name == 'stock':
                     new_names[i] = 'instrument'
                 elif name is None:
-                    # Infer from dtype
                     if pd.api.types.is_datetime64_any_dtype(level_vals):
                         new_names[i] = 'datetime'
                     elif level_vals.dtype == object or pd.api.types.is_string_dtype(level_vals):
-                        new_names[i] = 'instrument'
+                        if len(level_vals) > 0:
+                            sample = level_vals[:min(100, len(level_vals))]
+                            logger.warning(f"  Level {i} first 5: {sample[:5].tolist()} (dtype={level_vals.dtype})")
+                            is_date = False
+                            try:
+                                parsed = pd.to_datetime(sample, errors='raise')
+                                if parsed.notna().sum() > len(parsed) * 0.5:
+                                    is_date = True
+                                    logger.warning(f"  Level {i} is DATETIME")
+                            except Exception as e:
+                                logger.warning(f"  Level {i} NOT date: {e}")
+                            if is_date:
+                                new_names[i] = 'datetime'
+                                try:
+                                    converted = pd.to_datetime(df.index.levels[i])
+                                    df.index = df.index.set_levels(converted, level=i)
+                                except Exception:
+                                    pass
+                            else:
+                                new_names[i] = 'instrument'
+                                if i == 0:
+                                    # Fallback: try the other level for datetime detection
+                                    for j in range(1, len(names)):
+                                        other_sample = df.index.get_level_values(j)[:min(100, len(df))]
+                                        logger.warning(f"  Trying level {j} first 5: {other_sample[:5].tolist()}")
+                                        try:
+                                            other_parsed = pd.to_datetime(other_sample, errors='raise')
+                                            if other_parsed.notna().sum() > len(other_parsed) * 0.5:
+                                                df = df.swaplevel()
+                                                df = df.sort_index()
+                                                logger.warning(f"  SWAPPED levels (level0 not date, level{j} is)")
+                                                break
+                                        except Exception as e2:
+                                            logger.warning(f"  Level {j} failed: {e2}")
+                        else:
+                            new_names[i] = 'instrument'
             
             if new_names != names:
                 logger.debug(f"  {df_name} index renamed: {names} -> {new_names}")
@@ -503,9 +537,20 @@ class BacktestRunner:
             model.fit(dataset)
             print(f"[4/4] Train LightGBM done ({time.time()-train_start:.1f}s)")
             
-            # Generate prediction
             pred = model.predict(dataset)
             logger.debug(f"  Pred shape: {pred.shape}")
+            if isinstance(pred.index, pd.MultiIndex):
+                _new_tuples = []
+                for _t in pred.index.tolist():
+                    _t = list(_t)
+                    for _i in range(len(_t)):
+                        if not isinstance(_t[_i], pd.Timestamp):
+                            try:
+                                _t[_i] = pd.Timestamp(_t[_i])
+                            except Exception:
+                                pass
+                    _new_tuples.append(tuple(_t))
+                pred = pd.Series(pred.values, index=pd.MultiIndex.from_tuples(_new_tuples, names=pred.index.names), name=pred.name)
             
             # Save prediction
             sr = SignalRecord(recorder=R.get_recorder(), model=model, dataset=dataset)
@@ -582,6 +627,24 @@ class BacktestRunner:
                 except Exception as filter_err:
                     logger.warning(f"Price filter failed: {filter_err}")
                 
+                # LAST RESORT: force pred index level 0 to Timestamp via MultiIndex -> DataFrame -> type convert -> MultiIndex
+                if isinstance(pred, pd.Series) and isinstance(pred.index, pd.MultiIndex):
+                    try:
+                        _frame = pred.index.to_frame(index=False)
+                        for _col in _frame.columns:
+                            _sample = _frame[_col].dropna().iloc[:50] if len(_frame) > 0 else []
+                            if len(_sample) > 0:
+                                try:
+                                    _test = pd.to_datetime(_sample, errors='raise')
+                                    if _test.notna().sum() > len(_test) * 0.5:
+                                        _frame[_col] = pd.to_datetime(_frame[_col], errors='coerce')
+                                except Exception:
+                                    pass
+                        pred = pd.Series(pred.values, index=pd.MultiIndex.from_frame(_frame), name=pred.name)
+                        logger.info("  Forced pred index level 0 to Timestamp via DataFrame roundtrip")
+                    except Exception as _e:
+                        logger.warning(f"  Last-resort pred conversion failed: {_e}")
+
                 portfolio_metric_dict, indicator_dict = qlib_backtest(
                     executor={
                         "class": "SimulatorExecutor",

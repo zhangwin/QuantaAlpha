@@ -219,9 +219,16 @@ async def _run_mining(task_id: str, req: MiningStartRequest):
             qlib_symlink_dir = Path.home() / ".qlib" / "qlib_data"
             qlib_symlink_dir.mkdir(parents=True, exist_ok=True)
             cn_data_link = qlib_symlink_dir / "cn_data"
-            if not cn_data_link.exists() or os.readlink(str(cn_data_link)) != qlib_data:
-                if cn_data_link.is_symlink():
+            # If cn_data is a directory (stale) or wrong symlink, replace it
+            if cn_data_link.is_symlink():
+                if os.readlink(str(cn_data_link)) != qlib_data:
                     cn_data_link.unlink()
+                    cn_data_link.symlink_to(qlib_data)
+            elif cn_data_link.is_dir():
+                import shutil
+                shutil.rmtree(str(cn_data_link))
+                cn_data_link.symlink_to(qlib_data)
+            elif not cn_data_link.exists():
                 cn_data_link.symlink_to(qlib_data)
 
         # Build a temporary config with frontend parameter overrides

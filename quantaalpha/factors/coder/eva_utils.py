@@ -574,7 +574,9 @@ class FactorFinalDecisionEvaluator(FactorEvaluator):
                 return final_decision, final_feedback
 
             except json.JSONDecodeError as e:
-                raise ValueError("Failed to decode JSON response from API.") from e
+                attempts += 1
+                if attempts >= max_attempts:
+                    raise ValueError("Failed to decode JSON response from API after multiple attempts.") from e
             except KeyError as e:
                 attempts += 1
                 if attempts >= max_attempts:
